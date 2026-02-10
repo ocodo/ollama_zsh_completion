@@ -55,14 +55,17 @@ ollama [TAB]
 cp      -- Copy a model
 create  -- Create a model from a Modelfile
 help    -- Help about any command
-list    -- List models
+launch  -- Launch an integration with Ollama
+list    -- List models (alias: ls)
 ps      -- List running models
 pull    -- Pull a model from a registry
 push    -- Push a model to a registry
 rm      -- Remove a model
 run     -- Run a model
-serve   -- Start ollama
+serve   -- Start ollama (alias: start)
 show    -- Show information for a model
+signin  -- Sign in to ollama.com
+signout -- Sign out from ollama.com
 stop    -- Stop a running model
 ```
 
@@ -92,13 +95,36 @@ ollama help [TAB]
 cp      -- Copy a model
 create  -- Create a model from a Modelfile
 help    -- Help about any command
-list    -- List models
+launch  -- Launch an integration with Ollama
+list    -- List models (alias: ls)
 ps      -- List running models
 pull    -- Pull a model from a registry
 push    -- Push a model to a registry
 rm      -- Remove a model
 run     -- Run a model
-serve   -- Start ollama
+serve   -- Start ollama (alias: start)
 show    -- Show information for a model
+signin  -- Sign in to ollama.com
+signout -- Sign out from ollama.com
 stop    -- Stop a running model
+```
+
+```sh
+ollama launch [TAB]
+claude   -- Claude Code
+codex    -- Codex
+droid    -- Droid
+opencode -- OpenCode
+openclaw -- OpenClaw
+```
+
+```sh
+ollama run --think [TAB]
+# Thinking mode: true, false, high, medium, low
+```
+
+```sh
+ollama run [TAB]
+# Experimental flags: --experimental, --experimental-websearch, --experimental-yolo
+# Image generation: --width, --height, --steps, --seed, --negative
 ```
