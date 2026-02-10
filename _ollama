@@ -127,17 +127,20 @@ _ollama_quantizations() {
 # Main completion function
 _ollama() {
     local -a commands=(
-        'serve:Start ollama'
+        'serve:Start ollama (alias\: start)'
         'create:Create a model from a Modelfile'
         'show:Show information for a model'
         'run:Run a model'
         'stop:Stop a running model'
         'pull:Pull a model from a registry'
         'push:Push a model to a registry'
-        'list:List models'
+        'list:List models (alias\: ls)'
         'ps:List running models'
         'cp:Copy a model'
         'rm:Remove a model'
+        'launch:Launch an integration with Ollama'
+        'signin:Sign in to ollama.com'
+        'signout:Sign out from ollama.com'
         'help:Help about any command'
     )
 
@@ -153,13 +156,16 @@ _ollama() {
         ;;
         args)
             case $words[1] in
-                serve)
+                serve|start)
                     _arguments '--help[help for serve]'
                 ;;
                 create)
                     _arguments \
+                        '--experimental[Enable experimental safetensors model creation]' \
                         '-f+[Name of the Modelfile (default "Modelfile")]:file:_files' \
-                        '-q+[Quantize model to this level (e.g. q4_0)]:quantization:_ollama_quantizations' \
+                        '--file+[Name of the Modelfile (default "Modelfile")]:file:_files' \
+                        '-q+[Quantize model to this level (e.g. q4_K_M)]:quantization:_ollama_quantizations' \
+                        '--quantize+[Quantize model to this level (e.g. q4_K_M)]:quantization:_ollama_quantizations' \
                         '--help[help for create]'
                 ;;
                 show)
@@ -198,11 +204,23 @@ _ollama() {
                 ;;
                 run)
                     _arguments \
+                        '--dimensions+[Truncate output embeddings to specified dimension]:dimension:' \
+                        '--experimental[Enable experimental agent loop with tools]' \
+                        '--experimental-websearch[Enable web search tool in experimental mode]' \
+                        '--experimental-yolo[Skip all tool approval prompts]' \
                         '--format+[Response format (e.g. json)]:format:' \
+                        '--hidethinking[Hide thinking output]' \
                         '--insecure[Use an insecure registry]' \
                         '--keepalive+[Duration to keep a model loaded (e.g. 5m)]:duration:' \
                         '--nowordwrap[Don''t wrap words to the next line automatically]' \
+                        '--think=[Enable thinking mode]:mode:(true false high medium low)' \
+                        '--truncate[Truncate inputs exceeding context length]' \
                         '--verbose[Show timings for response]' \
+                        '--width+[Image width (experimental)]:width:' \
+                        '--height+[Image height (experimental)]:height:' \
+                        '--steps+[Denoising steps (experimental)]:steps:' \
+                        '--seed+[Random seed (experimental)]:seed:' \
+                        '--negative+[Negative prompt (experimental)]:prompt:' \
                         '--help[help for run]' \
                         '*::model and prompt:->model_and_prompt'
                     if [[ $state == model_and_prompt ]]; then
@@ -234,7 +252,7 @@ _ollama() {
                         _fetch_ollama_models
                     fi
                 ;;
-                list)
+                list|ls)
                     _arguments '--help[help for list]'
                 ;;
                 ps)
@@ -251,6 +269,26 @@ _ollama() {
                     if [[ $state == model ]]; then
                         _fetch_ollama_models
                     fi
+                ;;
+                launch)
+                    local -a integrations=(
+                        'claude:Claude Code'
+                        'codex:Codex'
+                        'droid:Droid'
+                        'opencode:OpenCode'
+                        'openclaw:OpenClaw'
+                    )
+                    _arguments \
+                        '--config[Configure without launching]' \
+                        '--model+[Model to use]:model:_fetch_ollama_models' \
+                        '--help[help for launch]' \
+                        '1:integration:->integration'
+                    if [[ $state == integration ]]; then
+                        _describe 'integrations' integrations
+                    fi
+                ;;
+                signin|signout)
+                    _arguments '--help[help for '$words[1]']'
                 ;;
                 help)
                     _arguments '--help[help for help]' '1:command:'
