@@ -343,7 +343,7 @@ _ollama_library_models() {
   _ollama_add library-models 'ollama.com model' vals descs
 }
 
-# `run` and `pull` happily take a model that is not downloaded yet.
+# For flags that accept a model the server may still have to pull.
 _ollama_any_models() {
   _alternative \
     'local-models:local model:_ollama_local_models' \
@@ -501,7 +501,7 @@ _ollama() {
         '--steps=[Denoising steps (experimental, image models)]:steps:(4 8 20 30 50)' \
         '--seed=[Random seed (experimental, image models)]:seed:' \
         '(-h --help)'{-h,--help}'[help for run]' \
-        '1:model:_ollama_any_models' \
+        '1:model:_ollama_local_models' \
         '*:prompt (file paths complete for multimodal input):_files' && ret=0
       ;;
 

@@ -39,7 +39,7 @@ Drop `_ollama` anywhere in your `$fpath` and run `compinit`.
 | `ollama stop <TAB>` | running models, with VRAM use |
 | `ollama pull <TAB>` | models from ollama.com/library |
 | `ollama pull qwen3:<TAB>` | the tags published for that model |
-| `ollama run <TAB>` | local models *and* library models (run pulls what is missing) |
+| `ollama run <TAB>` | models on the server only — a `run` should not offer 200 models you do not have |
 | `ollama run llama3.2 <TAB>` | file paths, for multimodal prompts |
 | `ollama create -f <TAB>` | Modelfiles first, then directories and files |
 | `ollama create -q <TAB>` | quantization levels, described |
@@ -99,7 +99,7 @@ zstyle ':completion:*:ollama:*' cache-ttl 3600
 # Never touch the network: `pull` and `run` then complete local models only
 zstyle ':completion:*:ollama:*' remote-models no
 
-# Show local models before ollama.com models on `ollama run`
+# Separate the model groups where both are offered (`ollama launch --model`)
 zstyle ':completion:*:*:ollama:*' group-name ''
 zstyle ':completion:*:*:ollama:*' tag-order local-models library-models
 ```
