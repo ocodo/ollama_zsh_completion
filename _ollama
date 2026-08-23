@@ -1,302 +1,497 @@
 #compdef ollama
-
+# ---------------------------------------------------------------------------
+# zsh completion for ollama (tracks the 0.32.x CLI)
+#
+# Features
+#   * every documented command / flag, plus the hidden experimental image flags
+#   * local models (`ollama list`) with size + age descriptions
+#   * running models (`ollama ps`) for `stop`
+#   * ollama.com/library models for `pull` / `run`
+#   * per-model tag completion: `ollama pull qwen3:<TAB>`
+#   * network results cached on disk, refreshed in the background (never blocks
+#     twice), no python required (curl > wget > python3)
+#
+# Styles (all optional)
+#   zstyle ':completion:*:ollama:*' cache-ttl 21600   # seconds, default 21600
+#   zstyle ':completion:*:ollama:*' remote-models no  # disable all network use
+#
+# Flush the cache with: _ollama_cache_flush
+#
 # Contributions:
-# Principal contributions by:
-# - ChatGPT [ZSH Expert](https://chatgpt.com/g/g-XczdbjXSW-zsh-expert) as the primary creator.
-# - Guidance and revisions by [obeone](https://github.com/obeone).
-# - Conversion to zsh plugin, refinements and extensions by [jasonm23](https://github.com/jason23)
+#   - ChatGPT [ZSH Expert] as the original creator
+#   - Guidance and revisions by [obeone](https://github.com/obeone)
+#   - zsh plugin conversion and extensions by [jasonm23](https://github.com/ocodo)
+# ---------------------------------------------------------------------------
 
-# Fetch online ollama library models
-fetch_ollama_library_models() {
-    python3 --version > /dev/null 2>&1
-    if [ $? -eq 0 ];then
-        python3 -c "
-from urllib.request import urlopen
-from html.parser import HTMLParser
+# --- plumbing --------------------------------------------------------------
 
-class ScrapeOllamaLibraries(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.links = []
+_ollama_cache_dir() {
+  local dir=${XDG_CACHE_HOME:-$HOME/.cache}/ollama-zsh-completion
+  [[ -d $dir ]] || mkdir -p -- $dir 2>/dev/null
+  print -r -- $dir
+}
 
-    def handle_starttag(self, tag, attrs):
-        if tag == 'a' and any(attr[0] == 'href' for attr in attrs):
-            href_value = [attr[1] for attr in attrs if attr[0] == 'href'][0]
-            if '/library/' in href_value:
-                processed_link = href_value.replace('/library/', '')
-                self.links.append(processed_link)
+# Remove every cached network response.
+_ollama_cache_flush() {
+  local dir
+  dir=$(_ollama_cache_dir) || return 1
+  rm -f -- $dir/*(N)
+  print -r -- "ollama completion cache flushed ($dir)"
+}
 
-url = 'https://ollama.com/library'
+_ollama_cache_ttl() {
+  local ttl
+  zstyle -s ':completion:*:ollama:*' cache-ttl ttl || ttl=21600
+  [[ $ttl == <-> ]] || ttl=21600
+  print -r -- $ttl
+}
+
+_ollama_remote_enabled() {
+  local remote
+  zstyle -s ':completion:*:ollama:*' remote-models remote || remote=yes
+  [[ $remote == (yes|true|on|1) ]]
+}
+
+_ollama_http_get() {
+  local url=$1
+  if (( $+commands[curl] )); then
+    curl -fsSL --max-time 8 -- "$url"
+  elif (( $+commands[wget] )); then
+    wget -q -O - --timeout=8 -- "$url"
+  elif (( $+commands[python3] )); then
+    python3 -c '
+import sys, urllib.request
 try:
-    with urlopen(url) as response:
-        html_content = response.read().decode('utf-8')
-        parser = ScrapeOllamaLibraries()
-        parser.feed(html_content)
-        result = '\n'.join(parser.links)
-        print(result)
-except Exception as e:
-    print(f'Failed to fetch model list from ollama.com [{str(e)}]')"
-    fi
+    with urllib.request.urlopen(sys.argv[1], timeout=8) as r:
+        sys.stdout.write(r.read().decode("utf-8", "replace"))
+except Exception:
+    sys.exit(1)
+' "$url"
+  else
+    return 1
+  fi
 }
 
-# Cache online ollama library models
-cached_models() {
-    local cache_age
-    local cached_file=~/.cache/ollama_library_models.cache
-    local timeout=3600 # 1hr cache
+# _ollama_cached <cache-key> <cmd> [args...]
+# Serves the cached copy immediately; when it is older than the TTL a refresh
+# is kicked off in the background so completion never waits twice.
+_ollama_cached() {
+  local key=$1; shift
+  local dir file ttl age
+  local -a mtime
+  dir=$(_ollama_cache_dir) || return 1
+  file=$dir/$key
+  ttl=$(_ollama_cache_ttl)
 
-    if [[ -f "$cached_file" ]];then
-       if [[ "$OSTYPE" == "darwin"* ]]; then
-           cache_age=$(( $(date +%s) - $(stat -f %m "${cached_file}") ))
-       else
-           cache_age=$(( $(date +%s) - $(stat -c "%Y" "${cached_file}") ))
-       fi
+  zmodload -F zsh/stat b:zstat 2>/dev/null
+  zmodload zsh/datetime 2>/dev/null
+
+  if [[ -s $file ]]; then
+    if zstat -A mtime +mtime -- $file 2>/dev/null; then
+      age=$(( EPOCHSECONDS - mtime[1] ))
+      if (( age > ttl )); then
+        ( "$@" >| $file.new 2>/dev/null && [[ -s $file.new ]] \
+            && mv -f -- $file.new $file || rm -f -- $file.new ) &!
+      fi
     fi
+    cat -- $file
+    return 0
+  fi
 
-    if [[ ! -f "${cached_file}" || ${cache_age} > ${timeout} ]]; then
-        cleaned_models=$(fetch_ollama_library_models)
-        if [ $? -eq 0 ]; then
-            echo "${cleaned_models}" > "${cached_file}"
-        fi
+  "$@" >| $file.new 2>/dev/null
+  if [[ -s $file.new ]]; then
+    mv -f -- $file.new $file
+    cat -- $file
+    return 0
+  fi
+  rm -f -- $file.new
+  return 1
+}
+
+# compadd a list of values with right-padded descriptions (avoids the ':'
+# quoting mess of _describe with tagged model names).
+# _ollama_add <tag> <group description> <values array name> <descs array name>
+_ollama_add() {
+  # Locals are prefixed to avoid shadowing the caller's arrays, which are
+  # dereferenced by name through ${(P)...}.
+  local _oa_tag=$1 _oa_descr=$2
+  local -a _oa_vals _oa_descs _oa_display expl
+  _oa_vals=( ${(P)3} )
+  _oa_descs=( ${(P)4} )
+  (( $#_oa_vals )) || return 1
+
+  local _oa_i _oa_width=0
+  for _oa_i in $_oa_vals; (( ${#_oa_i} > _oa_width )) && _oa_width=${#_oa_i}
+  for (( _oa_i = 1; _oa_i <= $#_oa_vals; _oa_i++ )); do
+    if [[ -n ${_oa_descs[_oa_i]} ]]; then
+      _oa_display+=( "${(r:_oa_width:)_oa_vals[_oa_i]}  -- ${_oa_descs[_oa_i]}" )
     else
-        cleaned_models=$(cat "${cached_file}")
+      _oa_display+=( "${_oa_vals[_oa_i]}" )
     fi
+  done
 
-    local -a models=("${(@f)"$(<${cached_file})"}")
-    print -r -- ${(qq)models}
+  _wanted $_oa_tag expl $_oa_descr compadd "$expl[@]" -d _oa_display -a _oa_vals
 }
 
-# Pass ollama library models to completion
+# --- model sources ---------------------------------------------------------
+
+# Models already present on the command line, so we never offer them twice.
+_ollama_seen_models() {
+  local -a seen
+  seen=( ${words[2,-1]} )
+  seen=( ${seen:#-*} )
+  seen[$(( CURRENT - 1 ))]=()
+  print -r -- ${(j: :)seen}
+}
+
+# Turn an `ollama list` / `ollama ps` table into "NAME<TAB>description" lines.
+# Columns are located from the header row, so extra or reordered columns in a
+# future release do not break the parser.
+# $1 = comma separated column names to build the description from.
+_ollama_parse_table() {
+  awk -v want=$1 '
+    NR == 1 {
+      ncol = split($0, head, /[ \t][ \t]*/)
+      for (i = 1; i <= ncol; i++) { name[i] = head[i]; start[i] = index($0, head[i]) }
+      next
+    }
+    NF {
+      delete col
+      for (i = 1; i <= ncol; i++) {
+        len = (i < ncol) ? start[i+1] - start[i] : 4096
+        v = substr($0, start[i], len)
+        gsub(/^[ \t]+|[ \t]+$/, "", v)
+        col[name[i]] = v
+      }
+      if (col["NAME"] == "") next
+      out = ""
+      nw = split(want, w, ",")
+      for (j = 1; j <= nw; j++)
+        if (col[w[j]] != "") out = out (out == "" ? "" : ", ") col[w[j]]
+      printf "%s\t%s\n", col["NAME"], out
+    }'
+}
+
+_ollama_local_models() {
+  local -a vals descs seen
+  local line
+  seen=( ${=$(_ollama_seen_models)} )
+
+  for line in ${(f)"$(ollama list 2>/dev/null | _ollama_parse_table 'SIZE,MODIFIED')"}; do
+    [[ -n $line ]] || continue
+    vals+=( ${line%%$'\t'*} )
+    descs+=( ${line#*$'\t'} )
+  done
+
+  if (( ! $#vals )); then
+    _message -r "no local models (is the ollama server running?)"
+    return 1
+  fi
+
+  local -a keep_v keep_d
+  local i
+  for (( i = 1; i <= $#vals; i++ )); do
+    (( ${seen[(I)${vals[i]}]} )) && continue
+    keep_v+=( ${vals[i]} )
+    keep_d+=( ${descs[i]} )
+  done
+
+  _ollama_add local-models 'local model' keep_v keep_d
+}
+
+_ollama_running_models() {
+  local -a vals descs
+  local line
+  for line in ${(f)"$(ollama ps 2>/dev/null | _ollama_parse_table 'SIZE,PROCESSOR,UNTIL')"}; do
+    [[ -n $line ]] || continue
+    vals+=( ${line%%$'\t'*} )
+    descs+=( ${line#*$'\t'} )
+  done
+
+  if (( ! $#vals )); then
+    _message -r 'no running models'
+    return 1
+  fi
+  _ollama_add running-models 'running model' vals descs
+}
+
+_ollama_fetch_library() {
+  _ollama_http_get https://ollama.com/library \
+    | grep -oE 'href="/library/[^"/?#]+"' \
+    | sed -e 's|href="/library/||' -e 's|"$||' \
+    | awk 'NF && !seen[$0]++'
+}
+
+_ollama_fetch_tags() {
+  local model=$1
+  _ollama_http_get "https://ollama.com/library/${model}/tags" \
+    | grep -oE "/library/${model}:[A-Za-z0-9._-]+" \
+    | sed 's|.*:||' \
+    | awk 'NF && !seen[$0]++'
+}
+
+# Tags of a library model, triggered as soon as the word contains a ':'.
+_ollama_library_tags() {
+  local model=${PREFIX%%:*}
+  [[ -n $model && $model != *[^A-Za-z0-9._/-]* ]] || return 1
+  _ollama_remote_enabled || return 1
+
+  local -a tags vals descs
+  tags=( ${(f)"$(_ollama_cached "tags-${model//\//%2F}" _ollama_fetch_tags $model)"} )
+  (( $#tags )) || return 1
+
+  vals=( ${model}:${^tags} )
+  descs=( )
+  _ollama_add library-tags "tag for $model" vals descs
+}
+
 _ollama_library_models() {
-    local -a models=("${(@Q)${(z)$(cached_models)}}")
-    _describe models 'models' models
+  [[ $PREFIX == *:* ]] && { _ollama_library_tags && return 0 }
+  _ollama_remote_enabled || { _ollama_local_models; return }
+
+  local -a vals descs
+  vals=( ${(f)"$(_ollama_cached library _ollama_fetch_library)"} )
+  if (( ! $#vals )); then
+    _message -r 'could not fetch ollama.com/library'
+    return 1
+  fi
+  descs=( )
+  _ollama_add library-models 'ollama.com model' vals descs
 }
 
-# Fetch local models
-_fetch_ollama_models() {
-    local -a models
-    local output="$(ollama list 2>/dev/null | sed 's/:/\\:/g')"  # Escape colons for zsh
-    if [[ -z "$output" ]]; then
-        _message "no models available or 'ollama list' failed"
-        return 1
-    fi
-    models=("${(@f)$(echo "$output" | awk 'NR>1 {print $1}')}")
-    if [[ ${#models} -eq 0 ]]; then
-        _message "no models found"
-        return 1
-    fi
-    _describe 'model names' models
+# `run` and `pull` happily take a model that is not downloaded yet.
+_ollama_any_models() {
+  _alternative \
+    'local-models:local model:_ollama_local_models' \
+    'library-models:ollama.com model:_ollama_library_models'
 }
 
-# Fetch running models for 'ollama stop'
-_fetch_ollama_running_models() {
-    local -a models
-    local output="$(ollama ps 2>/dev/null | sed 's/:/\\:/g')"
-    if [[ -z "$output" ]]; then
-        _message "no running models found"
-        return 1
-    fi
-    models=("${(@f)$(echo "$output" | awk 'NR>1 {print $1}')}")
-    if [[ ${#models} -eq 0 ]]; then
-        _message "no running models found"
-        return 1
-    fi
-    _describe 'running models' models
-}
+# --- value helpers ---------------------------------------------------------
 
-# Quantization options
 _ollama_quantizations() {
-    local -a quantizations=(
-        'q4_0:Supported Quantization'
-        'q4_1:Supported Quantization'
-        'q5_0:Supported Quantization'
-        'q5_1:Supported Quantization'
-        'q8_0:Supported Quantization'
-        'q3_K_S:K-means Quantization'
-        'q3_K_M:K-means Quantization'
-        'q3_K_L:K-means Quantization'
-        'q4_K_S:K-means Quantization'
-        'q4_K_M:K-means Quantization'
-        'q5_K_S:K-means Quantization'
-        'q5_K_M:K-means Quantization'
-        'q6_K:K-means Quantization'
-    )
-    _describe 'quantization levels' quantizations
+  local -a quant=(
+    'q4_K_M:4-bit K-means, medium (recommended)'
+    'q4_K_S:4-bit K-means, small'
+    'q5_K_M:5-bit K-means, medium'
+    'q5_K_S:5-bit K-means, small'
+    'q8_0:8-bit, near lossless'
+    'q6_K:6-bit K-means'
+    'q3_K_L:3-bit K-means, large'
+    'q3_K_M:3-bit K-means, medium'
+    'q3_K_S:3-bit K-means, small'
+    'q2_K:2-bit K-means'
+    'q4_0:4-bit legacy'
+    'q4_1:4-bit legacy'
+    'q5_0:5-bit legacy'
+    'q5_1:5-bit legacy'
+    'f16:16-bit float (safetensors)'
+    'bf16:16-bit brain float (safetensors)'
+  )
+  _describe -t quantizations 'quantization level' quant
 }
 
-# Main completion function
+_ollama_durations() {
+  local -a durations=(
+    '0:unload as soon as the request finishes'
+    '-1:keep loaded forever'
+    '30s:30 seconds'
+    '1m:1 minute'
+    '5m:5 minutes (default)'
+    '30m:30 minutes'
+    '1h:1 hour'
+    '24h:24 hours'
+  )
+  _describe -t durations 'keep-alive duration' durations
+}
+
+_ollama_modelfiles() {
+  _alternative \
+    'modelfiles:Modelfile:_files -g "(#i)*modelfile*"' \
+    'safetensors:model directory:_files -/' \
+    'files:file:_files'
+}
+
+_ollama_integrations() {
+  local -a integrations=(
+    'claude:Claude Code'
+    'chatgpt:ChatGPT (codex-app, codex-desktop, codex-gui)'
+    'codex:Codex'
+    'cline:Cline'
+    'copilot:Copilot CLI (copilot-cli)'
+    'droid:Droid'
+    'dsh:DeepSeek Harness (deepseek-harness)'
+    'hermes:Hermes Agent'
+    'hermes-desktop:Hermes Desktop'
+    'kimi:Kimi Code CLI'
+    'muse:Muse Code (muse-code)'
+    'omp:OMP'
+    'openclaw:OpenClaw (clawdbot, moltbot)'
+    'opencode:OpenCode'
+    'pi:Pi'
+    'pool:Pool'
+    'qwen:Qwen Code'
+    'vscode:VS Code (code)'
+  )
+  _describe -t integrations 'integration' integrations
+}
+
+_ollama_commands() {
+  local -a commands=(
+    'serve:Start Ollama (alias\: start)'
+    'create:Create a model'
+    'show:Show information for a model'
+    'run:Run a model'
+    'stop:Stop a running model'
+    'pull:Pull a model from a registry'
+    'push:Push a model to a registry'
+    'signin:Sign in to ollama.com'
+    'signout:Sign out from ollama.com'
+    'list:List models (alias\: ls)'
+    'ps:List running models'
+    'cp:Copy a model'
+    'rm:Remove a model'
+    'launch:Launch the Ollama menu or an integration'
+    'help:Help about any command'
+  )
+  _describe -t commands 'ollama command' commands
+}
+
+# --- main ------------------------------------------------------------------
+
 _ollama() {
-    local -a commands=(
-        'serve:Start ollama (alias\: start)'
-        'create:Create a model from a Modelfile'
-        'show:Show information for a model'
-        'run:Run a model'
-        'stop:Stop a running model'
-        'pull:Pull a model from a registry'
-        'push:Push a model to a registry'
-        'list:List models (alias\: ls)'
-        'ps:List running models'
-        'cp:Copy a model'
-        'rm:Remove a model'
-        'launch:Launch an integration with Ollama'
-        'signin:Sign in to ollama.com'
-        'signout:Sign out from ollama.com'
-        'help:Help about any command'
-    )
+  local curcontext=$curcontext state line ret=1
+  typeset -A opt_args
 
-    _arguments -C \
-        '--help[Help for ollama]' \
-        '--version[Show version information]' \
-        '1: :->command' \
-        '*:: :->args'
+  _arguments -C \
+    '(- 1 *)'{-v,--version}'[Show version information]' \
+    '(- 1 *)'{-h,--help}'[Help for ollama]' \
+    "--nowordwrap[Don't wrap words to the next line automatically]" \
+    '--verbose[Show timings for response]' \
+    '1: :_ollama_commands' \
+    '*:: :->args' && ret=0
 
-    case $state in
-        command)
-            _describe -t commands 'ollama command' commands
-        ;;
-        args)
-            case $words[1] in
-                serve|start)
-                    _arguments '--help[help for serve]'
-                ;;
-                create)
-                    _arguments \
-                        '--experimental[Enable experimental safetensors model creation]' \
-                        '-f+[Name of the Modelfile (default "Modelfile")]:file:_files' \
-                        '--file+[Name of the Modelfile (default "Modelfile")]:file:_files' \
-                        '-q+[Quantize model to this level (e.g. q4_K_M)]:quantization:_ollama_quantizations' \
-                        '--quantize+[Quantize model to this level (e.g. q4_K_M)]:quantization:_ollama_quantizations' \
-                        '--help[help for create]'
-                ;;
-                show)
-                    local -a show_options=(
-                        '--license[Show license of a model]'
-                        '--modelfile[Show Modelfile of a model]'
-                        '--parameters[Show parameters of a model]'
-                        '--system[Show system message of a model]'
-                        '--template[Show template of a model]'
-                        '-v[Show detailed model information]'
-                        '--verbose[Show detailed model information]'
-                        '--help[Help for show]'
-                    )
+  [[ $state == args ]] || return ret
 
-                    _arguments -C \
-                        '1:Model:->model' \
-                        '*:Options:->options'
+  curcontext="${curcontext%:*:*}:ollama-${words[1]}:"
 
-                    case $state in
-                        model)
-                            if [[ "$words[CURRENT]" == -* ]]; then
-                                _values 'options' $show_options
-                            else
-                                _fetch_ollama_models
-                            fi
-                        ;;
-                        options)
-                            # Vérification si une option a déjà été donnée
-                            if (( $#words > 2 )); then
-                                _message "only one option is allowed after model"
-                                return 1
-                            fi
-                            _values 'options' $show_options
-                        ;;
-                    esac
-                ;;
-                run)
-                    _arguments \
-                        '--dimensions+[Truncate output embeddings to specified dimension]:dimension:' \
-                        '--experimental[Enable experimental agent loop with tools]' \
-                        '--experimental-websearch[Enable web search tool in experimental mode]' \
-                        '--experimental-yolo[Skip all tool approval prompts]' \
-                        '--format+[Response format (e.g. json)]:format:' \
-                        '--hidethinking[Hide thinking output]' \
-                        '--insecure[Use an insecure registry]' \
-                        '--keepalive+[Duration to keep a model loaded (e.g. 5m)]:duration:' \
-                        '--nowordwrap[Don''t wrap words to the next line automatically]' \
-                        '--think=[Enable thinking mode]:mode:(true false high medium low)' \
-                        '--truncate[Truncate inputs exceeding context length]' \
-                        '--verbose[Show timings for response]' \
-                        '--width+[Image width (experimental)]:width:' \
-                        '--height+[Image height (experimental)]:height:' \
-                        '--steps+[Denoising steps (experimental)]:steps:' \
-                        '--seed+[Random seed (experimental)]:seed:' \
-                        '--negative+[Negative prompt (experimental)]:prompt:' \
-                        '--help[help for run]' \
-                        '*::model and prompt:->model_and_prompt'
-                    if [[ $state == model_and_prompt ]]; then
-                        _fetch_ollama_models
-                        _message "enter prompt"
-                    fi
-                ;;
-                stop)
-                    _arguments '--help[help for stop]' '*::model:->model'
-                    if [[ $state == model ]]; then
-                        _fetch_ollama_running_models
-                    fi
-                ;;
-                pull)
-                    _arguments \
-                        '--insecure[Use an insecure registry]' \
-                        '--help[help for pull]' \
-                        '*::model:->model'
-                    if [[ $state == model ]]; then
-                        _ollama_library_models
-                    fi
-                ;;
-                push)
-                    _arguments \
-                        '--insecure[Use an insecure registry]' \
-                        '--help[help for push]' \
-                        '*::model:->model'
-                    if [[ $state == model ]]; then
-                        _fetch_ollama_models
-                    fi
-                ;;
-                list|ls)
-                    _arguments '--help[help for list]'
-                ;;
-                ps)
-                    _arguments '--help[help for ps]'
-                ;;
-                cp)
-                    _arguments '--help[help for cp]' '1:SOURCE model:->model' '2:DESTINATION model:'
-                    if [[ $state == model ]]; then
-                        _fetch_ollama_models
-                    fi
-                ;;
-                rm)
-                    _arguments '--help[help for rm]' '*:model:->model'
-                    if [[ $state == model ]]; then
-                        _fetch_ollama_models
-                    fi
-                ;;
-                launch)
-                    local -a integrations=(
-                        'claude:Claude Code'
-                        'codex:Codex'
-                        'droid:Droid'
-                        'opencode:OpenCode'
-                        'openclaw:OpenClaw'
-                    )
-                    _arguments \
-                        '--config[Configure without launching]' \
-                        '--model+[Model to use]:model:_fetch_ollama_models' \
-                        '--help[help for launch]' \
-                        '1:integration:->integration'
-                    if [[ $state == integration ]]; then
-                        _describe 'integrations' integrations
-                    fi
-                ;;
-                signin|signout)
-                    _arguments '--help[help for '$words[1]']'
-                ;;
-                help)
-                    _arguments '--help[help for help]' '1:command:'
-                ;;
-            esac
-        ;;
-    esac
+  case ${words[1]} in
+    serve|start)
+      _arguments '(-h --help)'{-h,--help}'[help for serve]' && ret=0
+      ;;
+
+    create)
+      _arguments \
+        '--draft-quantize=[Quantize draft model to this level]:level:_ollama_quantizations' \
+        '--experimental[Enable experimental safetensors model creation]' \
+        '(-f --file)'{-f+,--file=}'[Name of the Modelfile (default "Modelfile")]:modelfile:_ollama_modelfiles' \
+        '(-q --quantize)'{-q+,--quantize=}'[Quantize model to this level (e.g. q4_K_M)]:level:_ollama_quantizations' \
+        '(-h --help)'{-h,--help}'[help for create]' \
+        '1:new model name:' && ret=0
+      ;;
+
+    show)
+      _arguments \
+        '--license[Show license of a model]' \
+        '--modelfile[Show Modelfile of a model]' \
+        '--parameters[Show parameters of a model]' \
+        '--system[Show system message of a model]' \
+        '--template[Show template of a model]' \
+        '(-v --verbose)'{-v,--verbose}'[Show detailed model information]' \
+        '(-h --help)'{-h,--help}'[help for show]' \
+        '1:model:_ollama_local_models' && ret=0
+      ;;
+
+    run)
+      _arguments \
+        '--dimensions=[Truncate output embeddings to this dimension (embedding models)]:dimensions:(64 128 256 512 768 1024)' \
+        '--format=[Response format]:format:(json)' \
+        '--hidethinking[Hide thinking output (if provided)]' \
+        '--insecure[Use an insecure registry]' \
+        '--keepalive=[Duration to keep the model loaded (e.g. 5m)]:duration:_ollama_durations' \
+        "--nowordwrap[Don't wrap words to the next line automatically]" \
+        '--think=-[Enable thinking mode]::mode:(true false high medium low)' \
+        '--truncate=-[Truncate embedding inputs exceeding the context length]::bool:(true false)' \
+        '--verbose[Show timings for response]' \
+        '--width=[Image width (experimental, image models)]:pixels:(512 768 1024 1280 1536)' \
+        '--height=[Image height (experimental, image models)]:pixels:(512 768 1024 1280 1536)' \
+        '--steps=[Denoising steps (experimental, image models)]:steps:(4 8 20 30 50)' \
+        '--seed=[Random seed (experimental, image models)]:seed:' \
+        '(-h --help)'{-h,--help}'[help for run]' \
+        '1:model:_ollama_any_models' \
+        '*:prompt (file paths complete for multimodal input):_files' && ret=0
+      ;;
+
+    stop)
+      _arguments \
+        '(-h --help)'{-h,--help}'[help for stop]' \
+        '1:model:_ollama_running_models' && ret=0
+      ;;
+
+    pull)
+      _arguments \
+        '--insecure[Use an insecure registry]' \
+        '(-h --help)'{-h,--help}'[help for pull]' \
+        '1:model:_ollama_library_models' && ret=0
+      ;;
+
+    push)
+      _arguments \
+        '--insecure[Use an insecure registry]' \
+        '(-h --help)'{-h,--help}'[help for push]' \
+        '1:model:_ollama_local_models' && ret=0
+      ;;
+
+    list|ls)
+      _arguments '(-h --help)'{-h,--help}'[help for list]' && ret=0
+      ;;
+
+    ps)
+      _arguments '(-h --help)'{-h,--help}'[help for ps]' && ret=0
+      ;;
+
+    cp)
+      _arguments \
+        '(-h --help)'{-h,--help}'[help for cp]' \
+        '1:source model:_ollama_local_models' \
+        '2:destination model:' && ret=0
+      ;;
+
+    rm)
+      _arguments \
+        '(-h --help)'{-h,--help}'[help for rm]' \
+        '*:model:_ollama_local_models' && ret=0
+      ;;
+
+    launch)
+      if (( ${words[(I)--]} )); then
+        # everything after `--` is passed through to the integration
+        _message -r 'extra arguments for the integration'
+        return 0
+      fi
+      _arguments \
+        '--config[Configure without launching]' \
+        '--model=[Model to use]:model:_ollama_any_models' \
+        '--restore[Restore an integration to its default profile]' \
+        '(-y --yes)'{-y,--yes}'[Automatically answer yes to confirmation prompts]' \
+        '(-h --help)'{-h,--help}'[help for launch]' \
+        '1:integration:_ollama_integrations' \
+        '*::extra args:_default' && ret=0
+      ;;
+
+    signin|signout)
+      _arguments '(-h --help)'{-h,--help}"[help for ${words[1]}]" && ret=0
+      ;;
+
+    help)
+      _arguments '1:command:_ollama_commands' && ret=0
+      ;;
+
+    *)
+      _default && ret=0
+      ;;
+  esac
+
+  return ret
 }
 
 _ollama "$@"
-

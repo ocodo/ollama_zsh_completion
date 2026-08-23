@@ -1,130 +1,108 @@
 # Ollama zsh completion plugin
 
-The plugin is based on [Obeone's Gist](https://gist.github.com/obeone/9313811fd61a7cbb843e0001a4434c58)
+Completion for the whole `ollama` CLI, tracking the 0.32.x command set.
+Based on [Obeone's Gist](https://gist.github.com/obeone/9313811fd61a7cbb843e0001a4434c58).
 
-# Installation
+## Installation
 
-## With Antidote
+### With Antidote
 
-I use Antidote for zsh plugins, but if you use a different system for managing your zsh, it's basically the same: just add `ocodo/ollama_zsh_completion` to your plugins list and reload your shell.
+Add to `~/.zsh_plugins.txt`:
 
-With [Antidote](https://github.com/mattmc3/antidote), installation is as simple as editing your `~/.zsh_plugins.txt` file and adding:
-
-```
+```text
 ocodo/ollama_zsh_completion
 ```
 
-Then reload:
+Then `source ~/.zshrc` or start a new shell. Update with `antidote update`.
+
+### With Oh My Zsh
 
 ```sh
-source ~/.zshrc
+git clone https://github.com/ocodo/ollama_zsh_completion.git \
+  ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/ollama
 ```
 
-Or just start a new shell. Update plugins using `antidote update`.
+Add `ollama` to your `plugins=(...)` list, then `omz reload`.
 
-## With Oh My Zsh
+### Manually
 
-If you use [Oh My Zsh](https://ohmyz.sh/), you can install this plugin manually:
+Drop `_ollama` anywhere in your `$fpath` and run `compinit`.
 
-```sh
-git clone https://github.com/ocodo/ollama_zsh_completion.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/ollama
-```
+## What it completes
 
-Then edit your `.zshrc` and add `ollama` to the list of plugins:
-
-```sh
-plugins=(... ollama)
-```
-
-Reload your omz:
-
-```sh
-omz reload
-```
-
----
-
-## Completion
-
-Command completion for all `ollama` CLI commands, [see the original gist for more info](https://gist.github.com/obeone/9313811fd61a7cbb843e0001a4434c58).
+| Context | Completion |
+| --- | --- |
+| `ollama <TAB>` | every command, with descriptions |
+| `ollama <cmd> -<TAB>` | the exact flags of that command, short and long forms grouped |
+| `ollama show\|push\|cp\|rm <TAB>` | local models, annotated with size and age |
+| `ollama rm a <TAB>` | remaining local models — already typed ones are dropped |
+| `ollama stop <TAB>` | running models (`ollama ps`), with size, processor and TTL |
+| `ollama pull <TAB>` | models from ollama.com/library |
+| `ollama pull qwen3:<TAB>` | the tags published for that model |
+| `ollama run <TAB>` | local models *and* library models (run pulls what is missing) |
+| `ollama run llama3.2 <TAB>` | file paths, for multimodal prompts |
+| `ollama create -f <TAB>` | Modelfiles first, then directories and files |
+| `ollama create -q <TAB>` | quantization levels, described |
+| `ollama run --think=<TAB>` | `true` `false` `high` `medium` `low` |
+| `ollama run --keepalive <TAB>` | usual durations, plus `0` and `-1` |
+| `ollama launch <TAB>` | the 18 supported integrations, aliases included |
+| `ollama help <TAB>` | command list |
 
 Examples:
 
-```sh
-ollama [TAB]
-cp      -- Copy a model
-create  -- Create a model from a Modelfile
-help    -- Help about any command
-launch  -- Launch an integration with Ollama
-list    -- List models (alias: ls)
-ps      -- List running models
-pull    -- Pull a model from a registry
-push    -- Push a model to a registry
-rm      -- Remove a model
-run     -- Run a model
-serve   -- Start ollama (alias: start)
-show    -- Show information for a model
-signin  -- Sign in to ollama.com
-signout -- Sign out from ollama.com
-stop    -- Stop a running model
+```text
+$ ollama show <TAB>
+llama3.2:latest          -- 2.0 GB, 2 weeks ago
+nomic-embed-text:latest  -- 274 MB, 5 months ago
+qwen3:8b                 -- 5.2 GB, 3 days ago
+
+$ ollama pull qwen3:<TAB>
+qwen3:0.6b        qwen3:14b-q4_K_M    qwen3:30b-a3b
+qwen3:0.6b-fp16   qwen3:14b-q8_0      qwen3:30b-a3b-q4_K_M
+...
+
+$ ollama launch <TAB>
+chatgpt         -- ChatGPT (codex-app, codex-desktop, codex-gui)
+claude          -- Claude Code
+cline           -- Cline
+...
 ```
 
-```sh
-ollama create -f [TAB]  # File completion for Modelfile
-```
+## Network use and caching
+
+Library models and tags are fetched from `ollama.com` with `curl` (falling back
+to `wget`, then `python3`). Responses are cached under
+`${XDG_CACHE_HOME:-~/.cache}/ollama-zsh-completion/`.
+
+The cache is served immediately and refreshed in the background once it goes
+stale, so only the very first completion of a given list ever waits on the
+network.
+
+Flush it with:
 
 ```sh
-ollama push|cp|run|rm|show [TAB]
-# Completion of local models
+_ollama_cache_flush
 ```
 
-```sh
-ollama pull [TAB]
-# Completion of models from ollama.com/library
+## Configuration
 
-Note: Results cached to ~/.cache/ollama_library_models.cache (1hr TTL)
+```zsh
+# Cache lifetime in seconds (default 21600 — 6 hours)
+zstyle ':completion:*:ollama:*' cache-ttl 3600
+
+# Never touch the network: `pull` and `run` then complete local models only
+zstyle ':completion:*:ollama:*' remote-models no
+
+# Show local models before ollama.com models on `ollama run`
+zstyle ':completion:*:*:ollama:*' group-name ''
+zstyle ':completion:*:*:ollama:*' tag-order local-models library-models
 ```
 
-```sh
-ollama stop [TAB]
-# Completion of running models (via `ollama ps`)
-```
+Local and running models come from `ollama list` / `ollama ps`, so they follow
+`OLLAMA_HOST` like the rest of the CLI. The table parser locates columns from
+the header row, so an added or reordered column in a future release will not
+break it.
 
-```sh
-ollama help [TAB]
-cp      -- Copy a model
-create  -- Create a model from a Modelfile
-help    -- Help about any command
-launch  -- Launch an integration with Ollama
-list    -- List models (alias: ls)
-ps      -- List running models
-pull    -- Pull a model from a registry
-push    -- Push a model to a registry
-rm      -- Remove a model
-run     -- Run a model
-serve   -- Start ollama (alias: start)
-show    -- Show information for a model
-signin  -- Sign in to ollama.com
-signout -- Sign out from ollama.com
-stop    -- Stop a running model
-```
+## License
 
-```sh
-ollama launch [TAB]
-claude   -- Claude Code
-codex    -- Codex
-droid    -- Droid
-opencode -- OpenCode
-openclaw -- OpenClaw
-```
-
-```sh
-ollama run --think [TAB]
-# Thinking mode: true, false, high, medium, low
-```
-
-```sh
-ollama run [TAB]
-# Experimental flags: --experimental, --experimental-websearch, --experimental-yolo
-# Image generation: --width, --height, --steps, --seed, --negative
-```
+MIT
