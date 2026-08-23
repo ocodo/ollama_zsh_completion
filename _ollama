@@ -200,17 +200,107 @@ for m in data.get("models") or []:
   fi
 }
 
+# /api/show capabilities of one model, minus the uninteresting "completion".
+_ollama_json_caps() {
+  if (( $+commands[jq] )); then
+    jq -r '(.capabilities // []) | map(select(. != "completion")) | join(", ")' 2>/dev/null
+  else
+    grep -o '"capabilities":\[[^]]*\]' \
+      | grep -o '"[a-z_]*"' | tr -d '"' | grep -v '^completion$' \
+      | awk 'NR>1 {printf ", "} {printf "%s", $0} END {print ""}'
+  fi
+}
+
+# $@ = model names -> "name<TAB>capabilities". One POST per model, so this only
+# ever runs in the background.
+_ollama_fetch_caps() {
+  local m json caps url
+  url=$(_ollama_base_url)/api/show
+  for m in "$@"; do
+    json=$(curl -fsS --max-time 6 -X POST -H 'Content-Type: application/json' \
+             -d "{\"model\":\"$m\"}" -- $url 2>/dev/null) || continue
+    caps=$(print -r -- $json | _ollama_json_caps)
+    [[ -n $caps ]] && print -r -- "${m}"$'\t'"${caps}"
+  done
+}
+
+_ollama_caps_file() {
+  print -r -- "$(_ollama_cache_dir)/caps-$(_ollama_host_key)"
+}
+
+_ollama_caps_refresh() {
+  local file=$(_ollama_caps_file) tmpf
+  tmpf=$file.$$
+  { [[ -f $file ]] && cat -- $file; _ollama_fetch_caps "$@" } \
+    | awk -F'\t' 'NF && !seen[$1]++' > $tmpf 2>/dev/null
+  if [[ -s $tmpf ]]; then mv -f -- $tmpf $file; else rm -f -- $tmpf; fi
+}
+
+# Annotate descriptions with model capabilities (vision, tools, thinking...).
+# Only what is already cached is used; anything missing is fetched in the
+# background, so the next completion has it and this one never waits.
+# $1/$2 = names of the value and description arrays to update.
+_ollama_apply_caps() {
+  local enabled
+  zstyle -s ':completion:*:ollama:*' show-capabilities enabled || enabled=yes
+  [[ $enabled == (yes|true|on|1) ]] || return 0
+  (( $+commands[curl] )) || return 0
+
+  local -a _ac_vals _ac_descs _ac_missing
+  local file=$(_ollama_caps_file) line i
+  typeset -A capmap
+  _ac_vals=( ${(P)1} )
+  _ac_descs=( ${(P)2} )
+
+  if [[ -f $file ]]; then
+    for line in ${(f)"$(<$file)"}; do
+      [[ -n $line ]] && capmap[${line%%$'\t'*}]=${line#*$'\t'}
+    done
+  fi
+
+  for i in $_ac_vals; do
+    [[ -n ${capmap[$i]} ]] || _ac_missing+=( $i )
+  done
+  (( $#_ac_missing )) && ( _ollama_caps_refresh ${_ac_missing[1,40]} ) &!
+
+  local caps
+  for (( i = 1; i <= $#_ac_vals; i++ )); do
+    caps=${capmap[${_ac_vals[i]}]}
+    [[ -n $caps ]] || continue
+    if [[ -n ${_ac_descs[i]} ]]; then
+      _ac_descs[i]="${_ac_descs[i]}, $caps"
+    else
+      _ac_descs[i]=$caps
+    fi
+  done
+  set -A $2 "${_ac_descs[@]}"
+}
+
 # Models from the server, API first, `ollama <subcommand>` as a fallback.
 # $1 = api path, $2 = cli subcommand, $3 = columns for the table parser.
 _ollama_server_models() {
-  local json
-  if json=$(_ollama_api $1) && [[ -n $json ]]; then
-    print -r -- $json | _ollama_json_models
+  local key ttl out
+  key="api-${2}-$(_ollama_host_key)"
+  zstyle -s ':completion:*:ollama:*' api-cache-ttl ttl || ttl=30
+  [[ $ttl == <-> ]] || ttl=30
+
+  if out=$(_ollama_cached $key $ttl _ollama_api_models $1) && [[ -n $out ]]; then
+    print -rl -- ${${(f)out}:#\#*}
     return 0
   fi
-  # The CLI fallback can be slow against a remote host, so it is cached for a
-  # few minutes and refreshed in the background.
+  # The CLI fallback starts the whole ollama binary, which can take seconds
+  # against a remote host, so it is cached for longer.
   _ollama_cached "cli-${2}-$(_ollama_host_key)" 300 _ollama_cli_table $2 $3
+}
+
+# Prints a "#none" sentinel when the server answers with an empty list, so an
+# idle server is cached as such instead of falling through to the slow CLI.
+_ollama_api_models() {
+  local json out
+  json=$(_ollama_api $1) || return 1
+  [[ -n $json ]] || return 1
+  out=$(print -r -- $json | _ollama_json_models)
+  [[ -n $out ]] && print -r -- $out || print -r -- '#none'
 }
 
 _ollama_cli_table() {
@@ -271,6 +361,8 @@ _ollama_local_models() {
     _message -r "no models on $(_ollama_base_url)"
     return 1
   fi
+
+  _ollama_apply_caps vals descs
 
   local -a keep_v keep_d
   local i
