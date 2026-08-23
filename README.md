@@ -34,9 +34,9 @@ Drop `_ollama` anywhere in your `$fpath` and run `compinit`.
 | --- | --- |
 | `ollama <TAB>` | every command, with descriptions |
 | `ollama <cmd> -<TAB>` | the exact flags of that command, short and long forms grouped |
-| `ollama show\|push\|cp\|rm <TAB>` | local models, annotated with size and age |
-| `ollama rm a <TAB>` | remaining local models — already typed ones are dropped |
-| `ollama stop <TAB>` | running models (`ollama ps`), with size, processor and TTL |
+| `ollama show\|push\|cp\|rm <TAB>` | models on the server, annotated with size, parameters and quantization |
+| `ollama rm a <TAB>` | remaining models — already typed ones are dropped |
+| `ollama stop <TAB>` | running models, with VRAM use |
 | `ollama pull <TAB>` | models from ollama.com/library |
 | `ollama pull qwen3:<TAB>` | the tags published for that model |
 | `ollama run <TAB>` | local models *and* library models (run pulls what is missing) |
@@ -52,9 +52,9 @@ Examples:
 
 ```text
 $ ollama show <TAB>
-llama3.2:latest          -- 2.0 GB, 2 weeks ago
-nomic-embed-text:latest  -- 274 MB, 5 months ago
-qwen3:8b                 -- 5.2 GB, 3 days ago
+all-minilm:latest        -- 44 MB, 23M, F16
+llama3.2:latest          -- 2.0 GB, 3.2B, Q4_K_M
+qwen3:8b                 -- 5.2 GB, 8.2B, Q4_K_M
 
 $ ollama pull qwen3:<TAB>
 qwen3:0.6b        qwen3:14b-q4_K_M    qwen3:30b-a3b
@@ -68,7 +68,13 @@ cline           -- Cline
 ...
 ```
 
-## Network use and caching
+## Where the model lists come from
+
+Your own models are read from the server's HTTP API (`/api/tags`, `/api/ps`) at
+whatever `OLLAMA_HOST` points to, parsed with `jq` or `python3`. Shelling out to
+`ollama list` instead is measurably slower — against a remote host it can take
+seconds, which is unusable at a `<TAB>` — so the CLI is only a fallback, and its
+output is cached for five minutes per host when it is used.
 
 Library models and tags are fetched from `ollama.com` with `curl` (falling back
 to `wget`, then `python3`). Responses are cached under
@@ -98,10 +104,9 @@ zstyle ':completion:*:*:ollama:*' group-name ''
 zstyle ':completion:*:*:ollama:*' tag-order local-models library-models
 ```
 
-Local and running models come from `ollama list` / `ollama ps`, so they follow
-`OLLAMA_HOST` like the rest of the CLI. The table parser locates columns from
-the header row, so an added or reordered column in a future release will not
-break it.
+The `ollama list` / `ollama ps` fallback parser locates columns from the header
+row rather than by field number, so an added or reordered column in a future
+release will not break it.
 
 ## License
 

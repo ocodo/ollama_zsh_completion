@@ -72,16 +72,16 @@ except Exception:
   fi
 }
 
-# _ollama_cached <cache-key> <cmd> [args...]
+# _ollama_cached <cache-key> <ttl|""> <cmd> [args...]
 # Serves the cached copy immediately; when it is older than the TTL a refresh
 # is kicked off in the background so completion never waits twice.
 _ollama_cached() {
-  local key=$1; shift
-  local dir file ttl age
+  local key=$1 ttl=$2; shift 2
+  local dir file age
   local -a mtime
   dir=$(_ollama_cache_dir) || return 1
   file=$dir/$key
-  ttl=$(_ollama_cache_ttl)
+  [[ $ttl == <-> ]] || ttl=$(_ollama_cache_ttl)
 
   zmodload -F zsh/stat b:zstat 2>/dev/null
   zmodload zsh/datetime 2>/dev/null
@@ -133,6 +133,90 @@ _ollama_add() {
   _wanted $_oa_tag expl $_oa_descr compadd "$expl[@]" -d _oa_display -a _oa_vals
 }
 
+# --- the ollama server -----------------------------------------------------
+
+# Base URL of the server, resolved from OLLAMA_HOST exactly like the CLI does.
+_ollama_base_url() {
+  local host=${OLLAMA_HOST:-127.0.0.1:11434} url scheme rest
+  case $host in
+    (http://*|https://*) url=$host ;;
+    (*)                  url="http://$host" ;;
+  esac
+  url=${url%/}
+  scheme=${url%%://*}
+  rest=${url#*://}
+  [[ $scheme == http && $rest != *:* ]] && url="$url:11434"
+  print -r -- $url
+}
+
+# A filesystem-safe key for the current server, so caches never mix hosts.
+_ollama_host_key() {
+  local url=$(_ollama_base_url)
+  print -r -- ${url//[^A-Za-z0-9]/_}
+}
+
+# Ask the server directly: `ollama list` shells out to the full CLI, which can
+# take seconds against a remote host, while /api/tags answers instantly.
+_ollama_api() {
+  (( $+commands[curl] )) || return 1
+  curl -fsS --max-time 4 -- "$(_ollama_base_url)$1" 2>/dev/null
+}
+
+# /api/tags or /api/ps JSON on stdin -> "name<TAB>description" lines.
+_ollama_json_models() {
+  if (( $+commands[jq] )); then
+    jq -r '
+      def hs: if . == null or . == 0 then ""
+              elif . >= 1073741824 then ((. * 10 / 1073741824 | round) / 10 | tostring) + " GB"
+              else ((. / 1048576 | round) | tostring) + " MB" end;
+      .models[]? |
+      [ .name,
+        ( [ ((.size_vram // .size) | hs),
+            (.details.parameter_size // ""),
+            (.details.quantization_level // "") ]
+          | map(select(. != "")) | join(", ") )
+      ] | @tsv' 2>/dev/null
+  elif (( $+commands[python3] )); then
+    python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+def hs(n):
+    if not n:
+        return ""
+    if n >= 1073741824:
+        return "%.1f GB" % (n / 1073741824.0)
+    return "%d MB" % round(n / 1048576.0)
+for m in data.get("models") or []:
+    det = m.get("details") or {}
+    bits = [hs(m.get("size_vram") or m.get("size")),
+            det.get("parameter_size"), det.get("quantization_level")]
+    print("%s\t%s" % (m.get("name", ""), ", ".join(b for b in bits if b)))
+' 2>/dev/null
+  else
+    grep -o '"name":"[^"]*"' | sed -e 's/"name":"//' -e 's/"$//'
+  fi
+}
+
+# Models from the server, API first, `ollama <subcommand>` as a fallback.
+# $1 = api path, $2 = cli subcommand, $3 = columns for the table parser.
+_ollama_server_models() {
+  local json
+  if json=$(_ollama_api $1) && [[ -n $json ]]; then
+    print -r -- $json | _ollama_json_models
+    return 0
+  fi
+  # The CLI fallback can be slow against a remote host, so it is cached for a
+  # few minutes and refreshed in the background.
+  _ollama_cached "cli-${2}-$(_ollama_host_key)" 300 _ollama_cli_table $2 $3
+}
+
+_ollama_cli_table() {
+  ollama $1 2>/dev/null | _ollama_parse_table $2
+}
+
 # --- model sources ---------------------------------------------------------
 
 # Models already present on the command line, so we never offer them twice.
@@ -177,14 +261,14 @@ _ollama_local_models() {
   local line
   seen=( ${=$(_ollama_seen_models)} )
 
-  for line in ${(f)"$(ollama list 2>/dev/null | _ollama_parse_table 'SIZE,MODIFIED')"}; do
+  for line in ${(f)"$(_ollama_server_models /api/tags list 'SIZE,MODIFIED')"}; do
     [[ -n $line ]] || continue
     vals+=( ${line%%$'\t'*} )
     descs+=( ${line#*$'\t'} )
   done
 
   if (( ! $#vals )); then
-    _message -r "no local models (is the ollama server running?)"
+    _message -r "no models on $(_ollama_base_url)"
     return 1
   fi
 
@@ -202,7 +286,7 @@ _ollama_local_models() {
 _ollama_running_models() {
   local -a vals descs
   local line
-  for line in ${(f)"$(ollama ps 2>/dev/null | _ollama_parse_table 'SIZE,PROCESSOR,UNTIL')"}; do
+  for line in ${(f)"$(_ollama_server_models /api/ps ps 'SIZE,PROCESSOR,UNTIL')"}; do
     [[ -n $line ]] || continue
     vals+=( ${line%%$'\t'*} )
     descs+=( ${line#*$'\t'} )
@@ -237,7 +321,7 @@ _ollama_library_tags() {
   _ollama_remote_enabled || return 1
 
   local -a tags vals descs
-  tags=( ${(f)"$(_ollama_cached "tags-${model//\//%2F}" _ollama_fetch_tags $model)"} )
+  tags=( ${(f)"$(_ollama_cached "tags-${model//\//%2F}" '' _ollama_fetch_tags $model)"} )
   (( $#tags )) || return 1
 
   vals=( ${model}:${^tags} )
@@ -250,7 +334,7 @@ _ollama_library_models() {
   _ollama_remote_enabled || { _ollama_local_models; return }
 
   local -a vals descs
-  vals=( ${(f)"$(_ollama_cached library _ollama_fetch_library)"} )
+  vals=( ${(f)"$(_ollama_cached library '' _ollama_fetch_library)"} )
   if (( ! $#vals )); then
     _message -r 'could not fetch ollama.com/library'
     return 1
